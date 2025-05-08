@@ -89,7 +89,6 @@ if is_wandb_available():
 
 logger = logging.get_logger(__name__)
 
-
 class OnlineDPOTrainer(Trainer):
     r"""
     Initialize OnlineDPOTrainer.
@@ -464,6 +463,7 @@ class OnlineDPOTrainer(Trainer):
         return prompt_ids, prompt_mask, completion_ids, completion_mask
 
     def _generate(self, model, prompts):
+        print("_generate") ###################################################
         eos_token_id = self.processing_class.eos_token_id
         pad_token_id = self.processing_class.pad_token_id
 
@@ -543,26 +543,83 @@ class OnlineDPOTrainer(Trainer):
         if is_conversational({"prompt": prompts[0]}):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
+        print(f"Prompts: {prompts}") ###################################################
+        print(f"Completions: {completions}") ###################################################
+
         # Get the reward from the reward model or judge
         if self.judge is not None:
+
+            ############################################################################
+            # OLD VERSION
+            ############################################################################
             # Once formatted, conversational data may contain special tokens (such as <|im_start|>) that are not
             # directly understandable by the judge and could alter its judgment. To avoid this and make the judge
             # independent of the model's chat template, we use the raw conversation data, and apply our own chat
             # template to it.
-            if is_conversational({"prompt": prompts[0]}):
-                environment = jinja2.Environment()
-                template = environment.from_string(SIMPLE_CHAT_TEMPLATE)
-                prompts = [template.render(messages=prompt) for prompt in prompts]
-                completions = [template.render(messages=completion) for completion in completions]
+            # if is_conversational({"prompt": prompts[0]}):
+            #     environment = jinja2.Environment()
+            #     template = environment.from_string(SIMPLE_CHAT_TEMPLATE)
+            #     prompts = [template.render(messages=prompt) for prompt in prompts]
+            #     completions = [template.render(messages=completion) for completion in completions]
 
-            ranks_of_first_completion = self.judge.judge(
-                prompts, list(zip(completions[:batch_size], completions[batch_size:]))
-            )
+            # ranks_of_first_completion = self.judge.judge(
+            #     prompts, list(zip(completions[:batch_size], completions[batch_size:]))
+            # )
 
             # convert ranks to a True/False mask:
             # when rank == 0, it means the first completion is the best
             # when rank == 1, it means the second completion is the best
-            mask = torch.tensor([rank == 0 for rank in ranks_of_first_completion], device=device)
+            # mask = torch.tensor([rank == 0 for rank in ranks_of_first_completion], device=device)
+            ############################################################################
+
+            ############################################################################
+            # NEW VERSION
+            ############################################################################
+            ranks_of_first_completion = self.judge.judge(
+                prompts, list(zip(completions[:batch_size], completions[batch_size:]))  # batch_size here is original_batch_size
+            )
+
+            original_batch_size_before_filtering = batch_size
+
+            # Judge returns 0 (choose first), 1 (choose second), or -1/None (tie).
+            # Filter out ties (rank == -1 or None).
+            valid_indices = [i for i, r in enumerate(ranks_of_first_completion) if r in [0, 1]]
+            if len(valid_indices) == 0:
+                print("--- only ties") ###################################################
+                # If all are ties, skip this batch entirely by returning zero loss
+                return torch.tensor(0.0, device=self.accelerator.device, requires_grad=True)
+
+            print("+++ some non-ties") ###################################################
+
+            # Keep only the valid examples
+            batch_size = len(valid_indices)  # New batch_size (number of valid pairs)
+
+            # Create indices for selecting from tensors with 2*original_batch_size_before_filtering first dimension
+            valid_indices_tensor = torch.tensor(valid_indices, device=device, dtype=torch.long)
+            indices_for_first_half_of_pairs = valid_indices_tensor
+            indices_for_second_half_of_pairs = valid_indices_tensor + original_batch_size_before_filtering
+            combined_valid_indices_for_all_completions = torch.cat((indices_for_first_half_of_pairs, indices_for_second_half_of_pairs))
+
+            # Filter tensors that were based on 2 * original_batch_size_before_filtering
+            prompt_ids_filtered = prompt_ids[combined_valid_indices_for_all_completions]
+            prompt_mask_filtered = prompt_mask[combined_valid_indices_for_all_completions]
+            completion_ids_filtered = completion_ids[combined_valid_indices_for_all_completions]
+            completion_mask_filtered = completion_mask[combined_valid_indices_for_all_completions]
+            contain_eos_token = contain_eos_token[combined_valid_indices_for_all_completions]
+
+            # Recompute completions and logprobs for valid subset
+            # These will now have a first dimension of 2 * batch_size (where batch_size is num_valid_pairs)
+            logprobs = self._forward(model, prompt_ids_filtered, prompt_mask_filtered, completion_ids_filtered, completion_mask_filtered)
+            with torch.no_grad():
+                if self.ref_model is not None:
+                    ref_logprobs = self._forward(self.ref_model, prompt_ids_filtered, prompt_mask_filtered, completion_ids_filtered, completion_mask_filtered)
+                else:
+                    with self.model.disable_adapter():
+                        ref_logprobs = self._forward(self.model, prompt_ids_filtered, prompt_mask_filtered, completion_ids_filtered, completion_mask_filtered)
+
+            mask = torch.tensor([ranks_of_first_completion[i] == 0 for i in valid_indices], device=device)
+            ############################################################################
+
         else:
             # The reward model may not have the same chat template or tokenizer as the model, so we need to use the
             # raw data (string), apply the chat template (if needed), and tokenize it with the reward processing class.
@@ -612,7 +669,16 @@ class OnlineDPOTrainer(Trainer):
         cr_ref_logprobs = ref_logprobs[cr_indices]
 
         # mask out the padding tokens
-        padding_mask = ~completion_mask.bool()
+        ############################################################################
+        # OLD VERSION
+        ############################################################################
+        # padding_mask = ~completion_mask.bool()
+        ############################################################################
+        # NEW VERSION
+        ############################################################################
+        current_completion_mask = completion_mask_filtered if self.judge is not None and len(valid_indices) > 0 else completion_mask
+        padding_mask = ~current_completion_mask.bool()
+        ############################################################################
         cr_padding_mask = padding_mask[cr_indices]
 
         cr_logprobs_sum = (cr_logprobs * ~cr_padding_mask).sum(1)
@@ -692,7 +758,10 @@ class OnlineDPOTrainer(Trainer):
         else:
             self.accelerator.backward(loss, **kwargs)
 
+        print("update done") ###################################################
+
         return loss.detach() / self.args.gradient_accumulation_steps
+
 
     # Same as Trainer._maybe_log_save_evaluate but log our metrics
     # start_time defaults to None to allow compatibility with transformers<=4.46
@@ -741,6 +810,7 @@ class OnlineDPOTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
 
     # Copy-pasted from transformers.Trainer to maintain compatibility with earlier versions.
     # This can be removed once the minimum transformers version is updated to 4.47.
