@@ -4,19 +4,20 @@
 Usage:
 
 ### python examples/scripts/dpo_online.py \
+### CUDA_VISIBLE_DEVICES=0
 
-accelerate launch \
+CUDA_VISIBLE_DEVICES=0 accelerate launch \
     --num_processes 1 \
     examples/scripts/train_online_dpo_gsm8k.py \
     --model_name_or_path meta-llama/Llama-2-7b-chat-hf  \
     --learning_rate 5.0e-6 \
     --output_dir runs/Llama-2-7b-chat-hf \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 1 \
+    --per_device_train_batch_size 5 \
+    --gradient_accumulation_steps 2 \
     --use_peft \
     --max_new_tokens 128 \
     --max_length 256 \
-    --logging_steps 10
+    --logging_steps 5
 
 ### UNUSED:
     --warmup_ratio 0.1 \
@@ -92,7 +93,7 @@ class GSM8KCorrectnessJudge(BasePairwiseJudge):
     def judge(self, prompts, completion_pairs):
         # prompts: list of strings
         # completion_pairs: list of string pairs (completion1, completion2); each completion looks like this: [{"role": "assistant", "content": completion}]
-        # Return a list of ranks: 0 if completion1 is better, 1 if completion2 is better, None for ties
+        # Return a list of ranks: 0 if completion1 is better, 1 if completion2 is better, -1 if both are wrong, -2 if both are correct
         results = []
 
         for prompt, (c1, c2) in zip(prompts, completion_pairs):
@@ -113,8 +114,10 @@ class GSM8KCorrectnessJudge(BasePairwiseJudge):
                 results.append(0)
             elif reward1 < reward2:
                 results.append(1)
-            else:
-                results.append(None)  # Tie
+            elif reward1 == reward2 == 1.0:
+                results.append(-2)  # Both completions are correct
+            elif reward1 == reward2 == 0.0:
+                results.append(-1)  # Both completions are wrong
 
             # print(f"Reward 1: {reward1}")
             # print(f"Reward 2: {reward2}")

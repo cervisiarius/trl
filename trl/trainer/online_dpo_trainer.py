@@ -242,6 +242,8 @@ class OnlineDPOTrainer(Trainer):
             "logps/rejected": [],
             "val/contain_eos_token": [],
             "beta": [],
+            # Added by Bob:
+            "val/fraction_correct": [],
         }
         if self.reward_model is not None:
             self.stats["objective/rlhf_reward"] = []
@@ -463,7 +465,6 @@ class OnlineDPOTrainer(Trainer):
         return prompt_ids, prompt_mask, completion_ids, completion_mask
 
     def _generate(self, model, prompts):
-        print("_generate") ###################################################
         eos_token_id = self.processing_class.eos_token_id
         pad_token_id = self.processing_class.pad_token_id
 
@@ -579,15 +580,28 @@ class OnlineDPOTrainer(Trainer):
                 prompts, list(zip(completions[:batch_size], completions[batch_size:]))  # batch_size here is original_batch_size
             )
 
+            # ADDED BY BOB:
+            # Count how many completions are correct.
+            num_correct = []
+            for result in ranks_of_first_completion:
+                if result in [0, 1]:
+                    num_correct.append(1.0)  # Exactly one correct
+                elif result == -2:
+                    num_correct.append(2.0)  # Both correct
+                elif result == -1:
+                    num_correct.append(0.0)  # None correct
+            num_correct = torch.tensor(num_correct, device=self.accelerator.device, dtype=torch.float32)
+
             original_batch_size_before_filtering = batch_size
 
-            # Judge returns 0 (choose first), 1 (choose second), or -1/None (tie).
-            # Filter out ties (rank == -1 or None).
+            # Judge returns 0 (choose first), 1 (choose second), or -1/-2 (tie).
+            # Filter out ties (rank == -1/-2).
             valid_indices = [i for i, r in enumerate(ranks_of_first_completion) if r in [0, 1]]
             if len(valid_indices) == 0:
                 print("--- only ties") ###################################################
-                # If all are ties, skip this batch entirely by returning zero loss
-                return torch.tensor(0.0, device=self.accelerator.device, requires_grad=True)
+                # If all are ties, skip this batch entirely by returning NaN loss
+                ################### TODO: UNTESTED
+                return torch.tensor(float("nan"), device=self.accelerator.device)
 
             print("+++ some non-ties") ###################################################
 
@@ -605,7 +619,9 @@ class OnlineDPOTrainer(Trainer):
             prompt_mask_filtered = prompt_mask[combined_valid_indices_for_all_completions]
             completion_ids_filtered = completion_ids[combined_valid_indices_for_all_completions]
             completion_mask_filtered = completion_mask[combined_valid_indices_for_all_completions]
-            contain_eos_token = contain_eos_token[combined_valid_indices_for_all_completions]
+
+            # Also consider pairs with equal scores when counting generations with EOS.
+            # contain_eos_token = contain_eos_token[combined_valid_indices_for_all_completions]
 
             # Recompute completions and logprobs for valid subset
             # These will now have a first dimension of 2 * batch_size (where batch_size is num_valid_pairs)
@@ -736,6 +752,8 @@ class OnlineDPOTrainer(Trainer):
         accuracy = margin > 0
         self.stats["rewards/accuracies"].append(accuracy.float().mean().item())
         self.stats["beta"].append(self.beta)
+        # Added by Bob:
+        self.stats["val/fraction_correct"].append(self.accelerator.gather_for_metrics(num_correct).mean().item())
 
         if (
             self.args.torch_empty_cache_steps is not None
