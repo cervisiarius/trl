@@ -582,15 +582,16 @@ class OnlineDPOTrainer(Trainer):
 
             # ADDED BY BOB:
             # Count how many completions are correct.
-            num_correct = []
+            ############## TODO: UNTESTED (current run stores twice this value)
+            correct = []
             for result in ranks_of_first_completion:
                 if result in [0, 1]:
-                    num_correct.append(1.0)  # Exactly one correct
+                    correct.extend([0, 1])  # Exactly one correct
                 elif result == -2:
-                    num_correct.append(2.0)  # Both correct
+                    correct.extend([1, 1])  # Both correct
                 elif result == -1:
-                    num_correct.append(0.0)  # None correct
-            num_correct = torch.tensor(num_correct, device=self.accelerator.device, dtype=torch.float32)
+                    correct.extend([0, 0])  # None correct
+            correct = torch.tensor(correct, device=self.accelerator.device, dtype=torch.float32)
 
             original_batch_size_before_filtering = batch_size
 
@@ -753,7 +754,7 @@ class OnlineDPOTrainer(Trainer):
         self.stats["rewards/accuracies"].append(accuracy.float().mean().item())
         self.stats["beta"].append(self.beta)
         # Added by Bob:
-        self.stats["val/fraction_correct"].append(self.accelerator.gather_for_metrics(num_correct).mean().item())
+        self.stats["val/fraction_correct"].append(self.accelerator.gather_for_metrics(correct).mean().item())
 
         if (
             self.args.torch_empty_cache_steps is not None
